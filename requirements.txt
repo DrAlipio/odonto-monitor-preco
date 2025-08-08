@@ -1,6 +1,4 @@
-flask
-requests
-beautifulsoup4
-pandas
 fastapi
 uvicorn
+requests
+beautifulsoup4
