@@ -1,3 +1,8 @@
+from pydantic import BaseModel
+from typing import Optional, List, Literal
+import pandas as pd
+import os
+from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -193,3 +198,83 @@ def registrar_compra(body: RegistrarCompraBody):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
+# =========================
+# REGISTRO DE COMPRAS (CSV)
+# =========================
+
+CSV_PATH = os.environ.get("CSV_PATH", "/tmp/compras.csv")
+
+class ItemCompra(BaseModel):
+    produto: str
+    marca: Optional[str] = None
+    tamanho: Optional[str] = None
+    quantidade: Optional[int] = 1
+    fornecedor: Optional[str] = None
+    url: Optional[str] = None
+    site: Optional[Literal["dentalcremer", "dentalspeed", "suryadental", "desconhecido"]] = "desconhecido"
+    preco_pago: float
+    data: Optional[str] = None  # formato "YYYY-MM-DD"
+
+class RegistrarCompraRequest(BaseModel):
+    itens: List[ItemCompra]
+
+def now_iso() -> str:
+    # (se você já tiver now_iso() definido acima, pode remover esta função duplicada)
+    try:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return datetime.utcnow().isoformat() + "Z"
+
+def _salvar_itens_em_csv(itens: List[ItemCompra]) -> dict:
+    linhas = []
+    for it in itens:
+        linhas.append({
+            "timestamp": now_iso(),
+            "data": it.data or now_iso()[:10],
+            "produto": it.produto,
+            "marca": it.marca or "",
+            "tamanho": it.tamanho or "",
+            "quantidade": int(it.quantidade or 1),
+            "fornecedor": it.fornecedor or "",
+            "site": it.site,
+            "url": it.url or "",
+            "preco_pago": float(it.preco_pago),
+        })
+
+    df_novo = pd.DataFrame(linhas)
+
+    # Garante diretório e faz append
+    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
+    if os.path.exists(CSV_PATH):
+        df_antigo = pd.read_csv(CSV_PATH)
+        df_all = pd.concat([df_antigo, df_novo], ignore_index=True)
+    else:
+        df_all = df_novo
+
+    df_all.to_csv(CSV_PATH, index=False)
+    return {"ok": True, "salvos": len(linhas), "arquivo": CSV_PATH}
+
+@app.post("/registrar_compra")
+def registrar_compra(payload: RegistrarCompraRequest):
+    """
+    Registra itens de compra em um CSV no servidor.
+    Corpo esperado:
+    {
+      "itens": [
+        {
+          "produto": "Nome",
+          "marca": "Opcional",
+          "tamanho": "Opcional",
+          "quantidade": 1,
+          "fornecedor": "Opcional",
+          "url": "Opcional",
+          "site": "dentalspeed|dentalcremer|suryadental|desconhecido",
+          "preco_pago": 99.9,
+          "data": "YYYY-MM-DD"   # opcional
+        }
+      ]
+    }
+    """
+    res = _salvar_itens_em_csv(payload.itens)
+    return res
