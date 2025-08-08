@@ -11,6 +11,219 @@ from datetime import datetime
 import requests, re, csv, os
 from bs4 import BeautifulSoup
 
+# === DB setup (adicione no topo do arquivo, após seus imports) ===
+import os
+from datetime import date, datetime
+from typing import List, Optional, Dict
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Date, func
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+load_dotenv()  # carrega .env localmente
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL".lower()) or os.getenv("database_url")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não definida (Render > Settings > Environment).")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Mapeamento simples para categorizar itens automaticamente (ajuste à vontade)
+CATEGORIAS_MAP = {
+    "lima": "Endodontia",
+    "guta": "Endodontia",
+    "algodão": "Básico",
+    "escova": "Higiene",
+    "anestésico": "Anestesia",
+}
+
+def inferir_categoria(nome: str) -> str:
+    n = (nome or "").lower()
+    for chave, cat in CATEGORIAS_MAP.items():
+        if chave in n:
+            return cat
+    return "Outros"
+
+# --- Modelo da tabela ---
+class Compra(Base):
+    __tablename__ = "compras"
+    id = Column(Integer, primary_key=True, index=True)
+    item = Column(String, index=True)
+    marca = Column(String)
+    tamanho = Column(String)
+    categoria = Column(String, index=True)
+    quantidade = Column(Integer)
+    valor_unitario = Column(Float)
+    valor_total = Column(Float)
+    fornecedor = Column(String)
+    url = Column(String)
+    site = Column(String)
+    data_compra = Column(Date, default=date.today)
+
+Base.metadata.create_all(bind=engine)
+
+# --- Schemas Pydantic ---
+class ItemRegistro(BaseModel):
+    produto: str = Field(..., description="Nome do item")
+    marca: Optional[str] = None
+    tamanho: Optional[str] = None
+    quantidade: int = 1
+    fornecedor: Optional[str] = None
+    url: Optional[str] = None
+    site: Optional[str] = None
+    preco_pago: float = Field(..., description="Valor unitário pago (R$)")
+    data: Optional[str] = Field(None, description="YYYY-MM-DD")
+
+class RegistroCompraRequest(BaseModel):
+    itens: List[ItemRegistro]
+
+class RegistroCompraResponse(BaseModel):
+    status: str
+    inseridos: int
+
+class ResumoItem(BaseModel):
+    item: str
+    categoria: str
+    total_qty: int
+    total_gasto: float
+    gasto_medio: float
+
+class RelatorioMensalResponse(BaseModel):
+    ano: int
+    mes: int
+    total_gasto: float
+    por_item: List[ResumoItem]
+    por_categoria: Dict[str, float]
+
+# Se você já tem `app = FastAPI()`, remova esta linha.
+try:
+    app
+except NameError:
+    from fastapi import FastAPI
+    app = FastAPI()
+
+from fastapi import HTTPException, Query
+
+# --- Endpoint: registrar compras em lote ---
+@app.post("/registrar_compra", response_model=RegistroCompraResponse)
+def registrar_compra(payload: RegistroCompraRequest):
+    db = SessionLocal()
+    inseridos = 0
+    try:
+        for it in payload.itens:
+            cat = inferir_categoria(it.produto)
+            # data
+            d = None
+            if it.data:
+                try:
+                    d = datetime.strptime(it.data, "%Y-%m-%d").date()
+                except ValueError:
+                    d = date.today()
+            else:
+                d = date.today()
+
+            compra = Compra(
+                item=it.produto,
+                marca=it.marca,
+                tamanho=it.tamanho,
+                categoria=cat,
+                quantidade=it.quantidade,
+                valor_unitario=float(it.preco_pago),
+                valor_total=float(it.preco_pago) * int(it.quantidade),
+                fornecedor=it.fornecedor,
+                url=it.url,
+                site=it.site,
+                data_compra=d,
+            )
+            db.add(compra)
+            inseridos += 1
+
+        db.commit()
+        return RegistroCompraResponse(status="ok", inseridos=inseridos)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao registrar compras: {e}")
+    finally:
+        db.close()
+
+# --- Endpoint: relatório mensal (resumo por item e por categoria) ---
+@app.get("/relatorio_mensal", response_model=RelatorioMensalResponse)
+def relatorio_mensal(
+    ano: int = Query(..., ge=2000, le=2100),
+    mes: int = Query(..., ge=1, le=12),
+):
+    db = SessionLocal()
+    try:
+        # intervalo do mês
+        inicio = date(ano, mes, 1)
+        # pegar o primeiro dia do próximo mês
+        if mes == 12:
+            fim = date(ano + 1, 1, 1)
+        else:
+            fim = date(ano, mes + 1, 1)
+
+        # todas compras do mês
+        compras = db.query(Compra).filter(
+            Compra.data_compra >= inicio, Compra.data_compra < fim
+        )
+
+        total_gasto = float(compras.with_entities(func.coalesce(func.sum(Compra.valor_total), 0)).scalar() or 0)
+
+        # grupo por item
+        rows_item = (
+            db.query(
+                Compra.item,
+                Compra.categoria,
+                func.coalesce(func.sum(Compra.quantidade), 0).label("total_qty"),
+                func.coalesce(func.sum(Compra.valor_total), 0).label("total_gasto"),
+            )
+            .filter(Compra.data_compra >= inicio, Compra.data_compra < fim)
+            .group_by(Compra.item, Compra.categoria)
+            .order_by(func.sum(Compra.valor_total).desc())
+            .all()
+        )
+
+        por_item: List[ResumoItem] = []
+        for r in rows_item:
+            qty = int(r.total_qty or 0)
+            gast = float(r.total_gasto or 0)
+            por_item.append(
+                ResumoItem(
+                    item=r.item,
+                    categoria=r.categoria or "Outros",
+                    total_qty=qty,
+                    total_gasto=gast,
+                    gasto_medio=(gast / qty) if qty else 0.0,
+                )
+            )
+
+        # grupo por categoria
+        rows_cat = (
+            db.query(
+                Compra.categoria,
+                func.coalesce(func.sum(Compra.valor_total), 0).label("total_gasto"),
+            )
+            .filter(Compra.data_compra >= inicio, Compra.data_compra < fim)
+            .group_by(Compra.categoria)
+            .all()
+        )
+        por_categoria = { (r.categoria or "Outros"): float(r.total_gasto or 0) for r in rows_cat }
+
+        return RelatorioMensalResponse(
+            ano=ano,
+            mes=mes,
+            total_gasto=total_gasto,
+            por_item=por_item,
+            por_categoria=por_categoria,
+        )
+    finally:
+        db.close()
+
+
 app = FastAPI(title="Odonto Monitor Preço")
 
 # CORS liberado (o GPT chama a API do seu domínio Render)
