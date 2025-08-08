@@ -4,3 +4,5 @@ requests
 beautifulsoup4
 lxml
 pandas
+psycopg2-binary
+python-dotenv
