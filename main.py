@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 # ----------------- Imports base -----------------
-import os, re, csv
+import os, re
 from datetime import date, datetime
 from typing import List, Optional, Literal, Dict, Any
 
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -38,24 +37,19 @@ Base = declarative_base()
 
 # ----------------- Categorização -----------------
 CATEGORIAS_MAP = {
-    # Endodontia
     "lima": "Endodontia",
     "k-file": "Endodontia",
     "hedstroem": "Endodontia",
     "guta": "Endodontia",
     "cone": "Endodontia",
-    # Básico/consumo
     "algodão": "Básico",
     "gaze": "Básico",
     "luva": "Básico",
     "mascara": "Básico",
     "máscara": "Básico",
-    # Higiene
     "escova": "Higiene",
     "fio dental": "Higiene",
-    # Anestesia
-    "anest": "Anestesia",  # pega anestésico/anestesia
-    # Adicione suas palavras → categoria aqui em cima
+    "anest": "Anestesia",
 }
 
 def inferir_categoria(nome: str) -> str:
@@ -85,15 +79,15 @@ Base.metadata.create_all(bind=engine)
 
 # ----------------- Schemas -----------------
 class ItemRegistro(BaseModel):
-    produto: str = Field(..., description="Nome do item")
+    produto: str
     marca: Optional[str] = None
     tamanho: Optional[str] = None
     quantidade: int = 1
     fornecedor: Optional[str] = None
     url: Optional[str] = None
     site: Optional[str] = None
-    preco_pago: float = Field(..., description="Valor unitário pago (R$)")
-    data: Optional[str] = Field(None, description="YYYY-MM-DD")
+    preco_pago: float
+    data: Optional[str] = None
 
 class RegistroCompraRequest(BaseModel):
     itens: List[ItemRegistro]
@@ -113,7 +107,7 @@ class RelatorioMensalResponse(BaseModel):
     ano: int
     mes: int
     total_gasto: float
-    por_item: List[ResumoItem]   # já vem em ordem de quem mais gastou
+    por_item: List[ResumoItem]
     por_categoria: Dict[str, float]
 
 # ----------------- App & CORS -----------------
@@ -138,10 +132,10 @@ def infer_site(url: str) -> str:
         return "suryadental"
     return "desconhecido"
 
-# R$ 1.234,56 -> 1234.56
 def parse_brl_price(text: str) -> Optional[float]:
     if not text:
         return None
+    import re
     m = re.search(r"(\d{1,3}(?:\.\d{3})*|\d+),\d{2}", text)
     if not m:
         return None
@@ -173,7 +167,7 @@ def scrape_generic(url: str) -> Dict[str, Any]:
             if txt:
                 candidates.append(txt)
 
-    candidates.append(html)  # fallback regex
+    candidates.append(html)
 
     preco = None
     for c in candidates:
@@ -196,7 +190,7 @@ class ItemVigiado(BaseModel):
     quantidade: Optional[int] = 1
     fornecedor: Optional[str] = None
     site: Optional[Literal["dentalcremer","dentalspeed","suryadental","desconhecido"]] = None
-    data: Optional[str] = None  # YYYY-MM-DD
+    data: Optional[str] = None
 
 class VerificarQuedasRequest(BaseModel):
     itens: List[ItemVigiado] = Field(..., min_items=1)
@@ -237,7 +231,6 @@ def verificar_quedas(payload: VerificarQuedasRequest):
             })
     return {"baixas": baixas}
 
-# ---------- Registrar compra (SALVA NO BANCO) ----------
 @app.post("/registrar_compra", response_model=RegistroCompraResponse)
 def registrar_compra(payload: RegistroCompraRequest):
     db = SessionLocal()
@@ -245,8 +238,6 @@ def registrar_compra(payload: RegistroCompraRequest):
     try:
         for it in payload.itens:
             cat = inferir_categoria(it.produto)
-
-            # data
             d = date.today()
             if it.data:
                 try:
@@ -278,7 +269,6 @@ def registrar_compra(payload: RegistroCompraRequest):
     finally:
         db.close()
 
-# ---------- Relatório mensal (ranking + categorias) ----------
 @app.get("/relatorio_mensal", response_model=RelatorioMensalResponse)
 def relatorio_mensal(
     ano: int = Query(..., ge=2000, le=2100),
@@ -287,17 +277,13 @@ def relatorio_mensal(
     db = SessionLocal()
     try:
         inicio = date(ano, mes, 1)
-        fim = date(ano + (mes == 12), (mes % 12) + 1, 1)  # primeiro dia do mês seguinte
-
+        fim = date(ano + (mes == 12), (mes % 12) + 1, 1)
         compras_q = db.query(Compra).filter(
             Compra.data_compra >= inicio, Compra.data_compra < fim
         )
-
         total_gasto = float(
             compras_q.with_entities(func.coalesce(func.sum(Compra.valor_total), 0)).scalar() or 0
         )
-
-        # Ranking por item (mais gasto no topo)
         rows_item = (
             db.query(
                 Compra.item,
@@ -310,7 +296,6 @@ def relatorio_mensal(
             .order_by(func.sum(Compra.valor_total).desc())
             .all()
         )
-
         por_item: List[ResumoItem] = []
         for r in rows_item:
             qty = int(r.total_qty or 0)
@@ -324,8 +309,6 @@ def relatorio_mensal(
                     gasto_medio=(gasto / qty) if qty else 0.0,
                 )
             )
-
-        # Totais por categoria
         rows_cat = (
             db.query(
                 Compra.categoria,
@@ -336,13 +319,59 @@ def relatorio_mensal(
             .all()
         )
         por_categoria = { (r.categoria or "Outros"): float(r.total_gasto or 0) for r in rows_cat }
-
         return RelatorioMensalResponse(
             ano=ano, mes=mes,
             total_gasto=total_gasto,
             por_item=por_item,
             por_categoria=por_categoria,
         )
+    finally:
+        db.close()
+
+# ---------- Listar compras (opcionalmente filtrar por mês/ano) ----------
+@app.get("/compras")
+def listar_compras(
+    mes: Optional[int] = Query(None, ge=1, le=12),
+    ano: Optional[int] = Query(None, ge=2000, le=2100)
+):
+    db = SessionLocal()
+    try:
+        query = db.query(Compra)
+        if mes and ano:
+            inicio = date(ano, mes, 1)
+            fim = date(ano + (mes == 12), (mes % 12) + 1, 1)
+            query = query.filter(Compra.data_compra >= inicio, Compra.data_compra < fim)
+        elif mes:
+            ano_atual = date.today().year
+            inicio = date(ano_atual, mes, 1)
+            fim = date(ano_atual + (mes == 12), (mes % 12) + 1, 1)
+            query = query.filter(Compra.data_compra >= inicio, Compra.data_compra < fim)
+        elif ano:
+            inicio = date(ano, 1, 1)
+            fim = date(ano + 1, 1, 1)
+            query = query.filter(Compra.data_compra >= inicio, Compra.data_compra < fim)
+
+        compras = query.order_by(Compra.data_compra.desc()).all()
+        return {
+            "total_registros": len(compras),
+            "compras": [
+                {
+                    "id": c.id,
+                    "produto": c.item,
+                    "marca": c.marca,
+                    "tamanho": c.tamanho,
+                    "categoria": c.categoria,
+                    "quantidade": c.quantidade,
+                    "valor_unitario": c.valor_unitario,
+                    "valor_total": c.valor_total,
+                    "fornecedor": c.fornecedor,
+                    "url": c.url,
+                    "site": c.site,
+                    "data_compra": c.data_compra.isoformat()
+                }
+                for c in compras
+            ]
+        }
     finally:
         db.close()
 
